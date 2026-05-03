@@ -1,12 +1,15 @@
 import os
 import io
 import csv
+import logging
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request, abort
 import yfinance as yf
 import requests
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 CROSS_ASSETS = [
@@ -501,6 +504,157 @@ fetch('/api/risk')
 </body>
 </html>
 """
+
+
+def collect_alerts(vix, cross, credit, alert_level):
+    """Return list of indicators whose status is at/above alert_level.
+
+    alert_level: 'red' (default) or 'amber' (also includes amber).
+    """
+    triggers = {"red"}
+    if alert_level == "amber":
+        triggers.add("amber")
+
+    alerts = []
+    if vix and vix.get("status") in triggers:
+        alerts.append({
+            "name": "VIX",
+            "status": vix["status"],
+            "value": f"{vix['latest']:.2f}",
+            "detail": f"amber {vix['bands']['amber']} / red {vix['bands']['red']}",
+        })
+    for c in credit or []:
+        if c.get("status") in triggers and c.get("latest") is not None:
+            alerts.append({
+                "name": c["label"],
+                "status": c["status"],
+                "value": f"{c['latest']:.0f} bps",
+                "detail": f"amber {c['bands']['amber']} / red {c['bands']['red']} bps",
+            })
+    for a in cross or []:
+        if a.get("status") in triggers and a.get("drawdown_1m") is not None:
+            t = a.get("thresholds", {})
+            alerts.append({
+                "name": a["label"],
+                "status": a["status"],
+                "value": f"1m DD {a['drawdown_1m']:+.2f}% (1w {a['change_1w']:+.2f}%)",
+                "detail": f"amber {t.get('amber')}% / red {t.get('red')}%",
+            })
+    # Sort red first, then amber
+    alerts.sort(key=lambda x: 0 if x["status"] == "red" else 1)
+    return alerts
+
+
+def render_alert_email(alerts, alert_level):
+    n_red = sum(1 for a in alerts if a["status"] == "red")
+    n_amber = sum(1 for a in alerts if a["status"] == "amber")
+    parts = []
+    if n_red:
+        parts.append(f"{n_red} red")
+    if n_amber:
+        parts.append(f"{n_amber} amber")
+    subject = "[Risk Alert] " + ", ".join(parts) if parts else "[Risk Alert]"
+
+    rows_html = "".join([
+        f"""<tr>
+            <td style="padding:8px 12px;border-bottom:1px solid #eee;">
+                <span style="display:inline-block;padding:2px 8px;border-radius:4px;color:#fff;font-size:11px;font-weight:600;text-transform:uppercase;
+                background:{'#c8362a' if a['status']=='red' else '#d99a1d'};">{a['status']}</span>
+            </td>
+            <td style="padding:8px 12px;border-bottom:1px solid #eee;font-weight:600;">{a['name']}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #eee;">{a['value']}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #eee;color:#666;font-size:12px;">{a['detail']}</td>
+        </tr>"""
+        for a in alerts
+    ])
+    html = f"""<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#111;">
+        <h2 style="margin:0 0 8px;">Market risk alert</h2>
+        <p style="color:#666;margin:0 0 16px;font-size:13px;">
+          Alert level: <strong>{alert_level}</strong> &middot; {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+        </p>
+        <table style="border-collapse:collapse;width:100%;font-size:14px;">
+            <thead><tr style="text-align:left;color:#666;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">
+                <th style="padding:8px 12px;">Status</th>
+                <th style="padding:8px 12px;">Indicator</th>
+                <th style="padding:8px 12px;">Value</th>
+                <th style="padding:8px 12px;">Thresholds</th>
+            </tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+    </div>"""
+
+    text_lines = [f"Market risk alert ({alert_level} level)", ""]
+    for a in alerts:
+        text_lines.append(f"  [{a['status'].upper()}] {a['name']}: {a['value']}  ({a['detail']})")
+    text = "\n".join(text_lines)
+
+    return subject, html, text
+
+
+def send_email_via_resend(subject, html, text, to_addr, from_addr, api_key):
+    r = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": from_addr,
+            "to": [to_addr],
+            "subject": subject,
+            "html": html,
+            "text": text,
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+@app.route("/cron/check-risk")
+def cron_check_risk():
+    secret = os.environ.get("CRON_SECRET")
+    if secret:
+        if request.args.get("key") != secret:
+            abort(403)
+
+    alert_level = (os.environ.get("ALERT_LEVEL") or "red").lower()
+    if alert_level not in ("red", "amber"):
+        alert_level = "red"
+
+    api_key = os.environ.get("RESEND_API_KEY")
+    to_addr = os.environ.get("ALERT_EMAIL")
+    from_addr = os.environ.get("ALERT_FROM", "Risk Dashboard <onboarding@resend.dev>")
+
+    if not api_key or not to_addr:
+        return jsonify({"error": "RESEND_API_KEY and ALERT_EMAIL must be set"}), 500
+
+    try:
+        vix = fetch_vix()
+        cross = fetch_cross_assets()
+        credit = fetch_credit_spreads()
+    except Exception as e:
+        logger.exception("data fetch failed")
+        return jsonify({"error": f"data fetch failed: {e}"}), 500
+
+    alerts = collect_alerts(vix, cross, credit, alert_level)
+    if not alerts:
+        logger.info("no alerts at level=%s", alert_level)
+        return jsonify({"sent": False, "reason": "no triggers", "level": alert_level})
+
+    subject, html, text = render_alert_email(alerts, alert_level)
+    try:
+        result = send_email_via_resend(subject, html, text, to_addr, from_addr, api_key)
+    except requests.HTTPError as e:
+        body = e.response.text if e.response is not None else ""
+        logger.error("resend error: %s %s", e, body)
+        return jsonify({"error": f"resend error: {e}", "body": body}), 502
+    except Exception as e:
+        logger.exception("email send failed")
+        return jsonify({"error": f"send failed: {e}"}), 500
+
+    logger.info("alert sent: %d items, level=%s", len(alerts), alert_level)
+    return jsonify({"sent": True, "alerts": len(alerts), "level": alert_level, "id": result.get("id")})
 
 
 @app.route("/")

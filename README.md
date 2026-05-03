@@ -28,6 +28,29 @@ Then open http://localhost:5000.
 
 The `Procfile` runs `gunicorn app:app`, suitable for Railway / Heroku-style platforms.
 
+## Email alerts
+
+`GET /cron/check-risk?key=$CRON_SECRET` evaluates current statuses and emails a
+summary via Resend if any indicator is at the configured alert level or worse.
+
+Required env vars (set in Railway):
+
+- `RESEND_API_KEY` — Resend API key
+- `ALERT_EMAIL` — recipient address
+- `CRON_SECRET` — random string; the endpoint requires `?key=<secret>` if set
+
+Optional:
+
+- `ALERT_LEVEL` — `red` (default) or `amber` (more sensitive)
+- `ALERT_FROM` — sender address. Defaults to `Risk Dashboard <onboarding@resend.dev>`,
+  which works without domain verification. For a custom from-address you'll need
+  to verify a domain in Resend.
+
+Schedule it as a Railway Cron service hitting
+`https://<your-app>.up.railway.app/cron/check-risk?key=<secret>` once a night
+(e.g. `0 22 * * *` UTC, after the US close). The endpoint returns
+`{"sent": false, "reason": "no triggers"}` when nothing is elevated.
+
 ## Caveats
 
 - End-of-day data only — VIX intraday spikes won't show up if the close was calmer.

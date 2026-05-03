@@ -582,7 +582,7 @@ def collect_alerts(vix, cross, credit, alert_level):
     return alerts
 
 
-def render_alert_email(alerts, alert_level):
+def render_alert_email(alerts, alert_level, dashboard_url):
     n_red = sum(1 for a in alerts if a["status"] == "red")
     n_amber = sum(1 for a in alerts if a["status"] == "amber")
     parts = []
@@ -592,12 +592,17 @@ def render_alert_email(alerts, alert_level):
         parts.append(f"{n_amber} amber")
     subject = "[Risk Alert] " + ", ".join(parts) if parts else "[Risk Alert]"
 
+    def status_badge(status):
+        bg = "#c8362a" if status == "red" else "#d99a1d"
+        return (
+            f'<a href="{dashboard_url}" style="display:inline-block;padding:2px 8px;border-radius:4px;'
+            f'color:#fff;font-size:11px;font-weight:600;text-transform:uppercase;text-decoration:none;'
+            f'background:{bg};">{status}</a>'
+        )
+
     rows_html = "".join([
         f"""<tr>
-            <td style="padding:8px 12px;border-bottom:1px solid #eee;">
-                <span style="display:inline-block;padding:2px 8px;border-radius:4px;color:#fff;font-size:11px;font-weight:600;text-transform:uppercase;
-                background:{'#c8362a' if a['status']=='red' else '#d99a1d'};">{a['status']}</span>
-            </td>
+            <td style="padding:8px 12px;border-bottom:1px solid #eee;">{status_badge(a['status'])}</td>
             <td style="padding:8px 12px;border-bottom:1px solid #eee;font-weight:600;">{a['name']}</td>
             <td style="padding:8px 12px;border-bottom:1px solid #eee;">{a['value']}</td>
             <td style="padding:8px 12px;border-bottom:1px solid #eee;color:#666;font-size:12px;">{a['detail']}</td>
@@ -605,9 +610,12 @@ def render_alert_email(alerts, alert_level):
         for a in alerts
     ])
     html = f"""<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#111;">
-        <h2 style="margin:0 0 8px;">Market risk alert</h2>
+        <h2 style="margin:0 0 8px;">
+            <a href="{dashboard_url}" style="color:#111;text-decoration:none;">Market risk alert</a>
+        </h2>
         <p style="color:#666;margin:0 0 16px;font-size:13px;">
           Alert level: <strong>{alert_level}</strong> &middot; {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+          &middot; <a href="{dashboard_url}" style="color:#666;">open dashboard &rarr;</a>
         </p>
         <table style="border-collapse:collapse;width:100%;font-size:14px;">
             <thead><tr style="text-align:left;color:#666;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">
@@ -618,9 +626,12 @@ def render_alert_email(alerts, alert_level):
             </tr></thead>
             <tbody>{rows_html}</tbody>
         </table>
+        <p style="color:#999;font-size:12px;margin-top:16px;">
+            Tap any status badge or <a href="{dashboard_url}" style="color:#999;">open the dashboard</a> for the full view.
+        </p>
     </div>"""
 
-    text_lines = [f"Market risk alert ({alert_level} level)", ""]
+    text_lines = [f"Market risk alert ({alert_level} level)", "", f"Dashboard: {dashboard_url}", ""]
     for a in alerts:
         text_lines.append(f"  [{a['status'].upper()}] {a['name']}: {a['value']}  ({a['detail']})")
     text = "\n".join(text_lines)
@@ -662,6 +673,7 @@ def cron_check_risk():
     api_key = os.environ.get("RESEND_API_KEY")
     to_addr = os.environ.get("ALERT_EMAIL")
     from_addr = os.environ.get("ALERT_FROM", "Risk Dashboard <onboarding@resend.dev>")
+    dashboard_url = os.environ.get("DASHBOARD_URL", "https://risk-dashboard.up.railway.app/")
 
     if not api_key or not to_addr:
         return jsonify({"error": "RESEND_API_KEY and ALERT_EMAIL must be set"}), 500
@@ -679,7 +691,7 @@ def cron_check_risk():
         logger.info("no alerts at level=%s", alert_level)
         return jsonify({"sent": False, "reason": "no triggers", "level": alert_level})
 
-    subject, html, text = render_alert_email(alerts, alert_level)
+    subject, html, text = render_alert_email(alerts, alert_level, dashboard_url)
     try:
         result = send_email_via_resend(subject, html, text, to_addr, from_addr, api_key)
     except requests.HTTPError as e:

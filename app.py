@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+# direction: "down" (default) — risk metric is max drawdown from rolling 1m high.
+# direction: "up" — risk metric is max gain from rolling 1m low (e.g. oil:
+# sharp upside is a stagflation/supply-shock signal, not a downside).
+# Per-asset `thresholds` overrides group defaults when present.
 CROSS_ASSETS = [
     {"ticker": "SPY",    "label": "US Large Cap (SPY)",      "group": "Equity"},
     {"ticker": "QQQ",    "label": "US Tech (QQQ)",           "group": "Equity"},
@@ -22,12 +26,12 @@ CROSS_ASSETS = [
     {"ticker": "DX-Y.NYB","label": "US Dollar Index (DXY)",  "group": "FX"},
     {"ticker": "JPY=X",  "label": "USDJPY",                  "group": "FX"},
     {"ticker": "GLD",    "label": "Gold (GLD)",              "group": "Commodity"},
-    {"ticker": "USO",    "label": "Oil (USO)",               "group": "Commodity"},
+    {"ticker": "USO",    "label": "Oil (USO)",               "group": "Commodity",
+     "direction": "up", "thresholds": {"amber": 5.0, "red": 10.0}},
     {"ticker": "DBC",    "label": "Broad Commodities (DBC)", "group": "Commodity"},
 ]
 
-# Per-asset-class drawdown thresholds (max drawdown from 1m rolling high, in %).
-# More negative = worse.
+# Default per-group thresholds for downside-risk assets (drawdown from 1m high, %).
 THRESHOLDS = {
     "Equity":    {"amber": -3.0, "red": -7.0},
     "Bonds":     {"amber": -2.0, "red": -5.0},
@@ -90,21 +94,37 @@ def fetch_vix():
     }
 
 
-def compute_drawdown_from_1m_high(closes):
-    """Max drawdown (most negative) from rolling 1-month high, looking at last ~22 sessions."""
+def compute_extreme_move(closes, direction="down"):
+    """Worst risk-direction move within the last ~22 sessions, in %.
+
+    direction='down' → max drawdown from rolling 1m high (negative number).
+    direction='up'   → max run-up from rolling 1m low (positive number).
+    """
     if len(closes) < 2:
         return None
     window = closes[-22:] if len(closes) >= 22 else closes
-    peak = window[0]
-    worst = 0.0
-    for px in window:
-        if px > peak:
-            peak = px
-        if peak > 0:
-            dd = (px - peak) / peak * 100.0
-            if dd < worst:
-                worst = dd
-    return round(worst, 2)
+    if direction == "up":
+        trough = window[0]
+        best = 0.0
+        for px in window:
+            if px < trough:
+                trough = px
+            if trough > 0:
+                up = (px - trough) / trough * 100.0
+                if up > best:
+                    best = up
+        return round(best, 2)
+    else:
+        peak = window[0]
+        worst = 0.0
+        for px in window:
+            if px > peak:
+                peak = px
+            if peak > 0:
+                dd = (px - peak) / peak * 100.0
+                if dd < worst:
+                    worst = dd
+        return round(worst, 2)
 
 
 def fetch_cross_assets():
@@ -121,6 +141,9 @@ def fetch_cross_assets():
 
     results = []
     for asset in CROSS_ASSETS:
+        direction = asset.get("direction", "down")
+        thresholds = asset.get("thresholds") or THRESHOLDS[asset["group"]]
+        move_label = "1m UP" if direction == "up" else "1m DD"
         try:
             if len(CROSS_ASSETS) == 1:
                 series = data["Close"]
@@ -128,29 +151,37 @@ def fetch_cross_assets():
                 series = data[asset["ticker"]]["Close"]
             closes = [float(x) for x in series.dropna().tolist()]
             if not closes:
-                results.append({**asset, "latest": None, "drawdown_1m": None,
+                results.append({**asset, "latest": None, "move_1m": None,
+                                "move_label": move_label, "direction": direction,
                                 "change_1w": None, "status": "unknown", "history": []})
                 continue
             latest = closes[-1]
             change_1w = None
             if len(closes) >= 6:
                 change_1w = round((closes[-1] / closes[-6] - 1.0) * 100.0, 2)
-            drawdown = compute_drawdown_from_1m_high(closes)
-            t = THRESHOLDS[asset["group"]]
-            status = classify(drawdown, t["amber"], t["red"], lower_is_worse=True)
+            move = compute_extreme_move(closes, direction)
+            status = classify(
+                move,
+                thresholds["amber"],
+                thresholds["red"],
+                lower_is_worse=(direction == "down"),
+            )
             dates = [d.strftime("%Y-%m-%d") for d in series.dropna().index]
             history = [{"date": d, "close": round(c, 4)} for d, c in zip(dates, closes)]
             results.append({
                 **asset,
                 "latest": round(latest, 4),
                 "change_1w": change_1w,
-                "drawdown_1m": drawdown,
+                "move_1m": move,
+                "move_label": move_label,
+                "direction": direction,
                 "status": status,
-                "thresholds": t,
+                "thresholds": thresholds,
                 "history": history[-66:],  # ~3 months
             })
         except Exception as e:
-            results.append({**asset, "latest": None, "drawdown_1m": None,
+            results.append({**asset, "latest": None, "move_1m": None,
+                            "move_label": move_label, "direction": direction,
                             "change_1w": None, "status": "unknown", "history": [],
                             "error": str(e)})
     return results
@@ -482,13 +513,19 @@ fetch('/api/risk')
         groups[g].forEach(a => {
             const tile = document.createElement('div');
             tile.className = 'tile ' + a.status;
-            const dd = a.drawdown_1m;
+            const move = a.move_1m;
             const wk = a.change_1w;
+            const moveLabel = a.move_label || '1m DD';
+            // For up-direction assets a rise is the risk: invert tone so red color
+            // applies to large positive moves rather than negative ones.
+            const moveTone = a.direction === 'up'
+                ? (move > 0 ? 'neg' : 'pos')
+                : tone(move);
             tile.innerHTML = `
                 <div class="tile-label">${a.label}</div>
                 <div class="tile-value">${fmtNum(a.latest, 2)}</div>
                 <div class="tile-row">
-                    <span class="tile-metric">1m DD <strong class="${tone(dd)}">${signed(dd)}</strong></span>
+                    <span class="tile-metric">${moveLabel} <strong class="${moveTone}">${signed(move)}</strong></span>
                     <span class="tile-metric">1w <strong class="${tone(wk)}">${signed(wk)}</strong></span>
                 </div>`;
             grid.appendChild(tile);
@@ -532,12 +569,12 @@ def collect_alerts(vix, cross, credit, alert_level):
                 "detail": f"amber {c['bands']['amber']} / red {c['bands']['red']} bps",
             })
     for a in cross or []:
-        if a.get("status") in triggers and a.get("drawdown_1m") is not None:
+        if a.get("status") in triggers and a.get("move_1m") is not None:
             t = a.get("thresholds", {})
             alerts.append({
                 "name": a["label"],
                 "status": a["status"],
-                "value": f"1m DD {a['drawdown_1m']:+.2f}% (1w {a['change_1w']:+.2f}%)",
+                "value": f"{a.get('move_label', '1m DD')} {a['move_1m']:+.2f}% (1w {a['change_1w']:+.2f}%)",
                 "detail": f"amber {t.get('amber')}% / red {t.get('red')}%",
             })
     # Sort red first, then amber
